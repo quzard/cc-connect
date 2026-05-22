@@ -980,6 +980,9 @@ app_secret = "your-feishu-app-secret"
 # client_secret = "your-dingtalk-client-secret"
 # allow_from = "*"  # Allowed staff IDs / 允许的员工 ID
 # share_session_in_channel = false  # If true, all users in a group share one agent session / 群聊共享会话
+# card_template_id = "your-ai-card-template-id.schema"  # Optional: enable DingTalk AI Card streaming / 可选：启用钉钉 AI Card 流式回复
+# card_template_key = "content"       # Template variable used for streamed markdown / 卡片模板中承载流式 Markdown 的变量名
+# card_throttle_ms = 300              # AI Card update throttle in milliseconds / AI Card 更新节流间隔（毫秒）
 
 # WPS Xiezuo / WPS 协作 (uncomment to enable / 取消注释以启用)
 # 1. Create a WPS Open Platform app and enable event WebSocket delivery

@@ -111,10 +111,71 @@ client_secret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 | 企业内消息通知发送 | `qyapi_chat_manage_send` | 发送消息 |
 | 机器人消息发送 | `qyapi_robot_message_send` | 机器人发送消息 |
 | 读取消息 | `qyapi_get_chat_message` | 读取消息内容 |
+| 卡片实例写权限 | `Card.Instance.Write` | 创建、投放、结束 AI Card |
+| 卡片流式写权限 | `Card.Streaming.Write` | 在 AI Card 中实时流式更新回复 |
 
 ### 4.3 申请权限
 
 点击「申请权限」，等待审批通过。
+
+---
+
+## 可选：启用 AI Card 流式回复
+
+配置 `card_template_id` 后，DingTalk 平台会优先把一次完整回复聚合到同一张 AI Card 中：
+
+- 先创建一张「处理中...」卡片
+- 工具调用和工具结果在卡片顶部显示为轻量状态行，例如 `✓ Bash · ✓ Read`
+- 正文在同一张卡片内实时更新
+- 完成时设置卡片状态为 `FINISHED`
+- 如果卡片创建失败，会自动降级到普通消息
+
+### 创建卡片模板
+
+1. 在钉钉开放平台进入「开发工具」→「卡片搭建」
+2. 新建或复制一个 AI 卡片模板
+3. 模板中至少保留一个文本变量，默认变量名为 `content`
+4. 发布模板后复制 `TemplateId`，形如 `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.schema`
+
+### 配置 cc-connect
+
+```toml
+[[projects.platforms]]
+type = "dingtalk"
+
+[projects.platforms.options]
+client_id = "dingxxxxxxxxxxxxxxx"
+client_secret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+card_template_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.schema"
+card_template_key = "content"   # 模板里的文本变量名；默认 content
+card_throttle_ms = 300          # 流式更新节流，默认 300ms
+```
+
+推荐配合安静显示模式，避免工具结果再作为独立消息发送：
+
+```toml
+[display]
+mode = "quiet"
+thinking_messages = false
+tool_messages = false
+tool_max_len = 500
+```
+
+在 AI Card 模式下，即使 `tool_messages = false`，cc-connect 仍会在同一张卡片里保留简洁的工具状态行；该配置只会阻止额外的独立工具消息。
+
+### 验证
+
+启动后发送一条会触发工具调用的问题。日志中应看到：
+
+```text
+msg="dingtalk: AI card created"
+msg="streaming card created for turn"
+msg="turn complete" tools=...
+```
+
+钉钉客户端中应只看到一张 AI Card 原地更新；不应再出现额外的 `Bash 状态 completed` 之类独立工具结果消息。
+
+如果直聊中出现 `spaceId is illegal`，请确认机器人消息回调中能拿到用户 staffId，并确认 AI Card 模板已发布到当前应用可用范围。群聊会使用 `IM_GROUP.{conversationId}`，直聊会使用 `IM_ROBOT.{senderStaffId}`。
 
 ---
 
