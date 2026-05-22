@@ -1,6 +1,7 @@
 package dingtalk
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -58,7 +59,7 @@ func TestGetAccessToken_ConcurrentAccess(t *testing.T) {
 func TestGetAccessToken_MutexExists(t *testing.T) {
 	// Verify that the tokenMu mutex field exists and works
 	p := &Platform{
-		clientID:    "test_client",
+		clientID:     "test_client",
 		clientSecret: "test_secret",
 	}
 
@@ -352,6 +353,227 @@ func TestProactiveRouting_DirectSessionUsesDirectAPI(t *testing.T) {
 	}
 	if rc.senderStaffId != "user111" {
 		t.Errorf("direct routing: senderStaffId=%q, want %q", rc.senderStaffId, "user111")
+	}
+}
+
+// ──────────────────────────────────────────────────────────────
+// AI Card payload tests
+// ──────────────────────────────────────────────────────────────
+
+type recordedDingTalkRequest struct {
+	Method string
+	Path   string
+	Header http.Header
+	Body   map[string]any
+}
+
+type recordingCardRT struct {
+	mu       sync.Mutex
+	requests []recordedDingTalkRequest
+}
+
+func (rt *recordingCardRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	var body map[string]any
+	if req.Body != nil {
+		data, _ := io.ReadAll(req.Body)
+		if len(strings.TrimSpace(string(data))) > 0 {
+			_ = json.Unmarshal(data, &body)
+		}
+	}
+	rt.mu.Lock()
+	rt.requests = append(rt.requests, recordedDingTalkRequest{
+		Method: req.Method,
+		Path:   req.URL.Path,
+		Header: req.Header.Clone(),
+		Body:   body,
+	})
+	rt.mu.Unlock()
+
+	respBody := `{}`
+	if req.URL.Path == "/v1.0/card/instances/createAndDeliver" {
+		respBody = `{"result":{"cardInstanceId":"card-instance-1","outTrackId":"out-track-1","deliverResults":[{"success":true}]}}`
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(respBody)),
+		Header:     make(http.Header),
+		Request:    req,
+	}, nil
+}
+
+func (rt *recordingCardRT) snapshot() []recordedDingTalkRequest {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	out := make([]recordedDingTalkRequest, len(rt.requests))
+	copy(out, rt.requests)
+	return out
+}
+
+func newTestCardPlatform(rt http.RoundTripper) *Platform {
+	return &Platform{
+		clientID:        "client-id",
+		clientSecret:    "client-secret",
+		robotCode:       "robot-code",
+		httpClient:      &http.Client{Transport: rt},
+		accessToken:     "cached-token",
+		tokenExpiry:     time.Now().Add(time.Hour),
+		cardTemplateID:  "template.schema",
+		cardTemplateKey: "content",
+		cardThrottleMs:  1,
+	}
+}
+
+func mapAt(t *testing.T, m map[string]any, key string) map[string]any {
+	t.Helper()
+	v, ok := m[key].(map[string]any)
+	if !ok {
+		t.Fatalf("%s = %#v, want object", key, m[key])
+	}
+	return v
+}
+
+func stringAt(t *testing.T, m map[string]any, key string) string {
+	t.Helper()
+	v, ok := m[key].(string)
+	if !ok {
+		t.Fatalf("%s = %#v, want string", key, m[key])
+	}
+	return v
+}
+
+func TestCreateAICard_DirectUsesSenderStaffSpaceID(t *testing.T) {
+	rt := &recordingCardRT{}
+	p := newTestCardPlatform(rt)
+
+	card, err := p.createAICard(context.Background(), replyContext{
+		conversationId: "conv-direct",
+		senderStaffId:  "staff-123",
+		isGroup:        false,
+	})
+	if err != nil {
+		t.Fatalf("createAICard() error = %v", err)
+	}
+	if card.cardInstanceId != "card-instance-1" || card.outTrackId != "out-track-1" {
+		t.Fatalf("card ids = %q/%q, want response ids", card.cardInstanceId, card.outTrackId)
+	}
+
+	reqs := rt.snapshot()
+	if len(reqs) != 1 {
+		t.Fatalf("requests = %d, want 1", len(reqs))
+	}
+	req := reqs[0]
+	if req.Method != http.MethodPost || req.Path != "/v1.0/card/instances/createAndDeliver" {
+		t.Fatalf("request = %s %s, want POST /v1.0/card/instances/createAndDeliver", req.Method, req.Path)
+	}
+	if got := req.Header.Get("x-acs-dingtalk-access-token"); got != "cached-token" {
+		t.Fatalf("access token header = %q, want cached-token", got)
+	}
+	if got := stringAt(t, req.Body, "openSpaceId"); got != "dtv1.card//IM_ROBOT.staff-123" {
+		t.Fatalf("openSpaceId = %q, want sender-staff direct space", got)
+	}
+	deliver := mapAt(t, req.Body, "imRobotOpenDeliverModel")
+	if got := stringAt(t, deliver, "spaceType"); got != "IM_ROBOT" {
+		t.Fatalf("spaceType = %q, want IM_ROBOT", got)
+	}
+	extension := mapAt(t, deliver, "extension")
+	if got := stringAt(t, extension, "dynamicSummary"); got != "true" {
+		t.Fatalf("dynamicSummary = %q, want true", got)
+	}
+	cardData := mapAt(t, req.Body, "cardData")
+	params := mapAt(t, cardData, "cardParamMap")
+	if got := stringAt(t, params, "flowStatus"); got != "1" {
+		t.Fatalf("initial flowStatus = %q, want processing status 1", got)
+	}
+	if _, ok := params["content"]; !ok {
+		t.Fatalf("cardParamMap missing template key content: %#v", params)
+	}
+}
+
+func TestCreateAICard_GroupUsesConversationSpaceID(t *testing.T) {
+	rt := &recordingCardRT{}
+	p := newTestCardPlatform(rt)
+
+	if _, err := p.createAICard(context.Background(), replyContext{
+		conversationId: "conv-group",
+		senderStaffId:  "staff-123",
+		isGroup:        true,
+	}); err != nil {
+		t.Fatalf("createAICard() error = %v", err)
+	}
+
+	reqs := rt.snapshot()
+	if len(reqs) != 1 {
+		t.Fatalf("requests = %d, want 1", len(reqs))
+	}
+	req := reqs[0]
+	if got := stringAt(t, req.Body, "openSpaceId"); got != "dtv1.card//IM_GROUP.conv-group" {
+		t.Fatalf("openSpaceId = %q, want group conversation space", got)
+	}
+	deliver := mapAt(t, req.Body, "imGroupOpenDeliverModel")
+	if got := stringAt(t, deliver, "robotCode"); got != "robot-code" {
+		t.Fatalf("group robotCode = %q, want robot-code", got)
+	}
+	if _, ok := req.Body["imRobotOpenDeliverModel"]; ok {
+		t.Fatalf("group payload should not include imRobotOpenDeliverModel: %#v", req.Body)
+	}
+}
+
+func TestAICardFinalize_TransitionsInputingStreamsAndFinishes(t *testing.T) {
+	rt := &recordingCardRT{}
+	p := newTestCardPlatform(rt)
+	card := &aiCard{
+		cardInstanceId: "card-instance-1",
+		outTrackId:     "out-track-1",
+		templateKey:    "content",
+		platform:       p,
+		state:          "processing",
+		throttleMs:     1,
+		done:           make(chan struct{}),
+	}
+	content := "结果如下：\n| name | value |\n| --- | --- |\n| a | 1 |"
+
+	if err := card.Finalize(context.Background(), content); err != nil {
+		t.Fatalf("Finalize() error = %v", err)
+	}
+
+	reqs := rt.snapshot()
+	if len(reqs) != 3 {
+		t.Fatalf("requests = %d, want INPUTING + streaming + FINISHED: %#v", len(reqs), reqs)
+	}
+
+	if reqs[0].Method != http.MethodPut || reqs[0].Path != "/v1.0/card/instances" {
+		t.Fatalf("first request = %s %s, want PUT /v1.0/card/instances", reqs[0].Method, reqs[0].Path)
+	}
+	inputingParams := mapAt(t, mapAt(t, reqs[0].Body, "cardData"), "cardParamMap")
+	if got := stringAt(t, inputingParams, "flowStatus"); got != "2" {
+		t.Fatalf("first flowStatus = %q, want INPUTING status 2", got)
+	}
+	if got := stringAt(t, inputingParams, "content"); !strings.Contains(got, "结果如下：\n\n| name | value |") {
+		t.Fatalf("INPUTING content was not normalized for card markdown: %q", got)
+	}
+
+	if reqs[1].Method != http.MethodPut || reqs[1].Path != "/v1.0/card/streaming" {
+		t.Fatalf("second request = %s %s, want PUT /v1.0/card/streaming", reqs[1].Method, reqs[1].Path)
+	}
+	if got := stringAt(t, reqs[1].Body, "key"); got != "content" {
+		t.Fatalf("streaming key = %q, want content", got)
+	}
+	if got, ok := reqs[1].Body["isFinalize"].(bool); !ok || !got {
+		t.Fatalf("streaming isFinalize = %#v, want true", reqs[1].Body["isFinalize"])
+	}
+	if got := stringAt(t, reqs[1].Body, "content"); !strings.Contains(got, "结果如下：\n\n| name | value |") {
+		t.Fatalf("streaming content was not normalized for card markdown: %q", got)
+	}
+
+	if reqs[2].Method != http.MethodPut || reqs[2].Path != "/v1.0/card/instances" {
+		t.Fatalf("third request = %s %s, want PUT /v1.0/card/instances", reqs[2].Method, reqs[2].Path)
+	}
+	finishedParams := mapAt(t, mapAt(t, reqs[2].Body, "cardData"), "cardParamMap")
+	if got := stringAt(t, finishedParams, "flowStatus"); got != "3" {
+		t.Fatalf("final flowStatus = %q, want FINISHED status 3", got)
+	}
+	if card.state != "finished" {
+		t.Fatalf("card.state = %q, want finished", card.state)
 	}
 }
 
