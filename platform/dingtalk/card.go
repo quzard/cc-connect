@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,6 +26,7 @@ type aiCard struct {
 
 	mu              sync.Mutex
 	state           string // "processing" | "finished" | "failed"
+	inputingStarted bool
 	lastSentContent string
 	lastSentAt      time.Time
 
@@ -71,13 +73,19 @@ func (p *Platform) createAICard(ctx context.Context, rc replyContext) (*aiCard, 
 	if isGroup {
 		openSpaceId = fmt.Sprintf("dtv1.card//IM_GROUP.%s", rc.conversationId)
 	} else {
-		openSpaceId = fmt.Sprintf("dtv1.card//IM_ROBOT.%s", p.robotCode)
+		spaceUserID := strings.TrimSpace(rc.senderStaffId)
+		if spaceUserID == "" {
+			spaceUserID = p.robotCode
+		}
+		openSpaceId = fmt.Sprintf("dtv1.card//IM_ROBOT.%s", spaceUserID)
 	}
 
 	// Build card data
 	cardParamMap := map[string]string{
-		"config":         `{"autoLayout":true,"enableForward":true}`,
-		p.cardTemplateKey: "",
+		"config":           `{"autoLayout":true,"enableForward":true}`,
+		"flowStatus":       "1",
+		"staticMsgContent": "",
+		p.cardTemplateKey:  "",
 	}
 
 	payload := map[string]any{
@@ -86,11 +94,11 @@ func (p *Platform) createAICard(ctx context.Context, rc replyContext) (*aiCard, 
 		"cardData": map[string]any{
 			"cardParamMap": cardParamMap,
 		},
-		"callbackType":            "STREAM",
-		"imGroupOpenSpaceModel":   map[string]any{"supportForward": true},
-		"imRobotOpenSpaceModel":   map[string]any{"supportForward": true},
-		"openSpaceId":             openSpaceId,
-		"userIdType":              1,
+		"callbackType":          "STREAM",
+		"imGroupOpenSpaceModel": map[string]any{"supportForward": true},
+		"imRobotOpenSpaceModel": map[string]any{"supportForward": true},
+		"openSpaceId":           openSpaceId,
+		"userIdType":            1,
 	}
 
 	// Set delivery model based on conversation type
@@ -102,6 +110,9 @@ func (p *Platform) createAICard(ctx context.Context, rc replyContext) (*aiCard, 
 		payload["imRobotOpenDeliverModel"] = map[string]any{
 			"spaceType": "IM_ROBOT",
 			"robotCode": p.robotCode,
+			"extension": map[string]any{
+				"dynamicSummary": "true",
+			},
 		}
 	}
 
@@ -315,69 +326,194 @@ func (c *aiCard) doStream(ctx context.Context, content string, isFinalize bool) 
 		return fmt.Errorf("get access token: %w", err)
 	}
 
+	if !c.inputingStarted {
+		if err := c.updateCardState(ctx, token, content, "2"); err != nil {
+			slog.Warn("dingtalk: AI card INPUTING update failed, continuing with streaming",
+				"error", err,
+				"outTrackId", c.outTrackId)
+		}
+		c.inputingStarted = true
+	}
+
+	streamContent := normalizeCardMarkdown(content)
+	if !isFinalize {
+		streamContent = strings.TrimRight(streamContent, "\n")
+	}
+
 	payload := map[string]any{
 		"outTrackId": c.outTrackId,
 		"key":        c.templateKey,
-		"content":    content,
+		"content":    streamContent,
 		"isFull":     true,
 		"isFinalize": isFinalize,
 		"isError":    false,
 		"guid":       generateGUID(),
 	}
 
-	bodyBytes, err := json.Marshal(payload)
+	status, respBody, err := c.putJSON(ctx, token, "https://api.dingtalk.com/v1.0/card/streaming", payload)
 	if err != nil {
-		return fmt.Errorf("marshal payload: %w", err)
+		return err
 	}
-
-	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPut,
-		"https://api.dingtalk.com/v1.0/card/streaming",
-		bytes.NewReader(bodyBytes))
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-acs-dingtalk-access-token", token)
 
 	slog.Debug("dingtalk: streaming AI card",
 		"outTrackId", c.outTrackId,
-		"contentLen", len(content),
+		"contentLen", len(streamContent),
 		"isFinalize", isFinalize)
 
-	resp, err := c.platform.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("do request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-
 	slog.Debug("dingtalk: streaming response",
-		"status", resp.StatusCode,
+		"status", status,
 		"body", string(respBody),
 		"isFinalize", isFinalize)
 
-	if resp.StatusCode != http.StatusOK {
+	if status != http.StatusOK && isCardQPSLimit(status, respBody) {
+		slog.Warn("dingtalk: AI card stream hit QPS limit, retrying after backoff",
+			"outTrackId", c.outTrackId,
+			"isFinalize", isFinalize)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+		payload["guid"] = generateGUID()
+		status, respBody, err = c.putJSON(ctx, token, "https://api.dingtalk.com/v1.0/card/streaming", payload)
+		if err != nil {
+			return err
+		}
+	}
+
+	if status != http.StatusOK {
 		slog.Error("dingtalk: stream AI card failed",
-			"status", resp.StatusCode,
+			"status", status,
 			"body", string(respBody))
 		// Check if we should trigger degrade
-		if resp.StatusCode == 403 || resp.StatusCode == 429 || resp.StatusCode >= 500 {
-			c.platform.activateCardDegrade(fmt.Sprintf("card.stream:%d", resp.StatusCode))
+		if status == 403 || status == 429 || status >= 500 {
+			c.platform.activateCardDegrade(fmt.Sprintf("card.stream:%d", status))
 			c.mu.Lock()
 			c.state = "failed"
 			close(c.done)
 			c.mu.Unlock()
 		}
-		return fmt.Errorf("stream AI card: status=%d, body=%s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("stream AI card: status=%d, body=%s", status, string(respBody))
 	}
 
 	slog.Debug("dingtalk: AI card streamed successfully", "isFinalize", isFinalize)
 	return nil
+}
+
+func (c *aiCard) updateCardState(ctx context.Context, token, content, status string) error {
+	order, _ := json.Marshal(map[string][]string{"order": []string{c.templateKey}})
+	payload := map[string]any{
+		"outTrackId": c.outTrackId,
+		"cardData": map[string]any{
+			"cardParamMap": map[string]string{
+				"config":            `{"autoLayout":true,"enableForward":true}`,
+				"flowStatus":        status,
+				"staticMsgContent":  "",
+				"sys_full_json_obj": string(order),
+				c.templateKey:       normalizeCardMarkdown(content),
+			},
+		},
+		"cardUpdateOptions": map[string]any{"updateCardDataByKey": true},
+	}
+	code, body, err := c.putJSON(ctx, token, "https://api.dingtalk.com/v1.0/card/instances", payload)
+	if err != nil {
+		return err
+	}
+	if code != http.StatusOK && isCardQPSLimit(code, body) {
+		slog.Warn("dingtalk: AI card state update hit QPS limit, retrying after backoff",
+			"outTrackId", c.outTrackId,
+			"flowStatus", status)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+		code, body, err = c.putJSON(ctx, token, "https://api.dingtalk.com/v1.0/card/instances", payload)
+		if err != nil {
+			return err
+		}
+	}
+	if code != http.StatusOK {
+		return fmt.Errorf("update AI card state: status=%d, body=%s", code, string(body))
+	}
+	return nil
+}
+
+func (c *aiCard) putJSON(ctx context.Context, token, url string, payload map[string]any) (int, []byte, error) {
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return 0, nil, fmt.Errorf("marshal payload: %w", err)
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPut, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return 0, nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-acs-dingtalk-access-token", token)
+	resp, err := c.platform.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, respBody, nil
+}
+
+func normalizeCardMarkdown(content string) string {
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	content = strings.ReplaceAll(content, "\r", "\n")
+	return ensureCardTableBlankLines(content)
+}
+
+func ensureCardTableBlankLines(content string) string {
+	lines := strings.Split(content, "\n")
+	if len(lines) < 3 {
+		return content
+	}
+	out := make([]string, 0, len(lines)+2)
+	for i, line := range lines {
+		if i > 0 && i+1 < len(lines) && looksLikeMarkdownTableRow(line) && looksLikeMarkdownTableDivider(lines[i+1]) {
+			prev := strings.TrimSpace(lines[i-1])
+			if prev != "" && !looksLikeMarkdownTableRow(lines[i-1]) {
+				out = append(out, "")
+			}
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+func looksLikeMarkdownTableRow(line string) bool {
+	line = strings.TrimSpace(line)
+	return strings.Contains(line, "|")
+}
+
+func looksLikeMarkdownTableDivider(line string) bool {
+	line = strings.TrimSpace(line)
+	if !strings.Contains(line, "-") || !strings.Contains(line, "|") {
+		return false
+	}
+	for _, r := range line {
+		switch r {
+		case '|', '-', ':', ' ':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func isCardQPSLimit(status int, body []byte) bool {
+	if status != http.StatusForbidden && status != http.StatusTooManyRequests {
+		return false
+	}
+	lower := strings.ToLower(string(body))
+	return strings.Contains(lower, "qps") ||
+		strings.Contains(lower, "rate") ||
+		strings.Contains(lower, "too many") ||
+		strings.Contains(lower, "throttl")
 }
 
 // Finalize sends the final content and marks the card as complete.
@@ -411,6 +547,17 @@ func (c *aiCard) Finalize(ctx context.Context, content string) error {
 	c.mu.Unlock()
 
 	err := c.doStream(ctx, content, true)
+	if err == nil {
+		if token, tokenErr := c.platform.getAccessToken(); tokenErr == nil {
+			if stateErr := c.updateCardState(ctx, token, content, "3"); stateErr != nil {
+				slog.Warn("dingtalk: AI card FINISHED update failed",
+					"error", stateErr,
+					"outTrackId", c.outTrackId)
+			}
+		} else {
+			slog.Warn("dingtalk: get access token for FINISHED update failed", "error", tokenErr)
+		}
+	}
 
 	c.mu.Lock()
 	c.inFlight = false

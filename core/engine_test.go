@@ -1436,6 +1436,94 @@ func TestProcessInteractiveEvents_ToolMessagesDisabledSuppressesToolProgressOnly
 	}
 }
 
+func TestProcessInteractiveEvents_StreamingCardKeepsSingleBubbleWithHiddenToolMessages(t *testing.T) {
+	p := &stubStreamingCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "dingtalk"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{Mode: "quiet", ThinkingMessages: false, ThinkingMaxLen: 300, ToolMaxLen: 500, ToolMessages: false})
+	sessionKey := "dingtalk:user-stream-card-hidden-tools"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("stream-card-hidden-tools")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-stream-card-hidden-tools",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	code := 0
+	success := true
+	agentSession.events <- Event{Type: EventThinking, Content: "Plan first"}
+	agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "pwd"}
+	agentSession.events <- Event{Type: EventToolResult, ToolName: "Bash", ToolResult: "/tmp", ToolStatus: "completed", ToolExitCode: &code, ToolSuccess: &success}
+	agentSession.events <- Event{Type: EventText, Content: "done"}
+	agentSession.events <- Event{Type: EventResult, Content: "done", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-stream-card-hidden-tools", time.Now(), nil, nil, state.replyCtx)
+
+	if sent := p.getSent(); len(sent) != 0 {
+		t.Fatalf("sent = %#v, want all progress and final text in the streaming card", sent)
+	}
+	if p.card == nil {
+		t.Fatal("streaming card was not created")
+	}
+	updates := p.card.getUpdates()
+	if len(updates) < 2 {
+		t.Fatalf("card updates = %#v, want placeholder and progress updates", updates)
+	}
+	if updates[0] != "⏳ 处理中..." {
+		t.Fatalf("first card update = %q, want processing placeholder", updates[0])
+	}
+	rendered := strings.Join(append(updates, p.card.getFinalized()...), "\n")
+	for _, want := range []string{"✓ Bash", "done"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("streaming card should contain %q, got %q", want, rendered)
+		}
+	}
+	for _, unwanted := range []string{"Tool #", "```", "/tmp"} {
+		if strings.Contains(rendered, unwanted) {
+			t.Fatalf("streaming card should stay compact without %q, got %q", unwanted, rendered)
+		}
+	}
+}
+
+func TestProcessInteractiveEvents_StreamingCardSuppressesStandaloneToolResult(t *testing.T) {
+	p := &stubStreamingCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "dingtalk"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{Mode: "full", ThinkingMessages: true, ThinkingMaxLen: 300, ToolMaxLen: 500, ToolMessages: true})
+	sessionKey := "dingtalk:user-stream-card-tool-result"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("stream-card-tool-result")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-stream-card-tool-result",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	code := 0
+	success := true
+	agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "echo hi"}
+	agentSession.events <- Event{Type: EventToolResult, ToolName: "Bash", ToolResult: "hi", ToolStatus: "completed", ToolExitCode: &code, ToolSuccess: &success}
+	agentSession.events <- Event{Type: EventText, Content: "done"}
+	agentSession.events <- Event{Type: EventResult, Content: "done", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-stream-card-tool-result", time.Now(), nil, nil, state.replyCtx)
+
+	if sent := p.getSent(); len(sent) != 0 {
+		t.Fatalf("sent = %#v, want no standalone tool-result or final message outside the card", sent)
+	}
+	if p.card == nil {
+		t.Fatal("streaming card was not created")
+	}
+	finalized := p.card.getFinalized()
+	if len(finalized) != 1 {
+		t.Fatalf("finalized card updates = %#v, want exactly one final card update", finalized)
+	}
+	if got := finalized[0]; !strings.Contains(got, "✓ Bash") || !strings.Contains(got, "done") {
+		t.Fatalf("final card = %q, want compact tool status plus final answer", got)
+	}
+}
+
 func TestProcessInteractiveEvents_CompactProgressCoalescesThinkingAndToolUse(t *testing.T) {
 	p := &stubCompactProgressPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
@@ -11290,6 +11378,7 @@ type stubStreamingCardPlatform struct {
 	stubPlatformEngine
 	cardCreated bool
 	cardFail    bool // when true, CreateStreamingCard returns an error
+	card        *stubStreamingCard
 }
 
 func (p *stubStreamingCardPlatform) CreateStreamingCard(_ context.Context, _ any) (StreamingCard, error) {
@@ -11297,15 +11386,53 @@ func (p *stubStreamingCardPlatform) CreateStreamingCard(_ context.Context, _ any
 		return nil, fmt.Errorf("stub: card_template_id not configured")
 	}
 	p.cardCreated = true
-	return &stubStreamingCard{}, nil
+	p.card = &stubStreamingCard{}
+	return p.card, nil
 }
 
 // stubStreamingCard is a minimal StreamingCard for tests.
-type stubStreamingCard struct{}
+type stubStreamingCard struct {
+	mu        sync.Mutex
+	updates   []string
+	finalized []string
+	failed    bool
+}
 
-func (c *stubStreamingCard) Update(_ context.Context, _ string) error   { return nil }
-func (c *stubStreamingCard) Finalize(_ context.Context, _ string) error { return nil }
-func (c *stubStreamingCard) Failed() bool                               { return false }
+func (c *stubStreamingCard) Update(_ context.Context, content string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.updates = append(c.updates, content)
+	return nil
+}
+
+func (c *stubStreamingCard) Finalize(_ context.Context, content string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.finalized = append(c.finalized, content)
+	return nil
+}
+
+func (c *stubStreamingCard) Failed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.failed
+}
+
+func (c *stubStreamingCard) getUpdates() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, len(c.updates))
+	copy(out, c.updates)
+	return out
+}
+
+func (c *stubStreamingCard) getFinalized() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, len(c.finalized))
+	copy(out, c.finalized)
+	return out
+}
 
 func TestHandleMessage_InstantReply_SendsConfirmationWhenEnabled(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}

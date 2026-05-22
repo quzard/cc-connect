@@ -629,7 +629,6 @@ func (e *Engine) SetSkipGit(skipGit bool) {
 	e.skipGit = skipGit
 }
 
-
 // SetInjectSender controls whether sender identity (platform and user ID) is
 // prepended to each message before forwarding it to the agent. When enabled,
 // the agent receives a preamble line like:
@@ -3114,34 +3113,121 @@ const defaultEventIdleTimeout = 2 * time.Hour
 
 // cardToolEntry stores a tool call record for card content rendering.
 type cardToolEntry struct {
-	Index int
-	Name  string
-	Input string
+	Index    int
+	Name     string
+	Input    string
+	Result   string
+	Status   string
+	ExitCode *int
+	Success  *bool
+	Done     bool
 }
 
 // buildCardContent constructs the full markdown for the streaming card.
 func buildCardContent(thinking string, tools []cardToolEntry, answer string) string {
 	var sb strings.Builder
-	if thinking != "" {
-		sb.WriteString("💭 **Thinking**\n\n")
-		sb.WriteString(thinking)
-		sb.WriteString("\n\n---\n\n")
+	progress := renderCardToolSummary(tools)
+	if progress != "" {
+		sb.WriteString(progress)
+		sb.WriteString("\n\n")
 	}
-	for _, t := range tools {
-		sb.WriteString(fmt.Sprintf("🔧 **Tool #%d**: `%s`\n", t.Index, t.Name))
-		if t.Input != "" {
-			sb.WriteString(t.Input)
-			sb.WriteString("\n")
-		}
-		sb.WriteString("\n")
-	}
-	if answer != "" {
-		if len(tools) > 0 || thinking != "" {
-			sb.WriteString("---\n\n")
-		}
+	answer = strings.TrimLeft(answer, "\n")
+	if strings.TrimSpace(answer) != "" {
 		sb.WriteString(answer)
+	} else if strings.TrimSpace(thinking) != "" {
+		sb.WriteString("💭 ")
+		sb.WriteString(oneLineCardSummary(thinking, 120))
+	} else if progress == "" {
+		sb.WriteString("⏳ 处理中...")
 	}
-	return sb.String()
+	return strings.TrimRight(sb.String(), "\n ")
+}
+
+func renderCardToolSummary(tools []cardToolEntry) string {
+	if len(tools) == 0 {
+		return ""
+	}
+	const maxVisibleTools = 8
+	parts := make([]string, 0, min(len(tools), maxVisibleTools)+1)
+	for i, t := range tools {
+		if i >= maxVisibleTools {
+			parts = append(parts, fmt.Sprintf("+%d", len(tools)-maxVisibleTools))
+			break
+		}
+		name := strings.TrimSpace(t.Name)
+		if name == "" {
+			name = "Tool"
+		}
+		parts = append(parts, fmt.Sprintf("%s %s", cardToolStatusMark(t), oneLineCardSummary(name, 32)))
+	}
+	return strings.Join(parts, " · ")
+}
+
+func cardToolStatusMark(t cardToolEntry) string {
+	if t.Success != nil {
+		if *t.Success {
+			return "✓"
+		}
+		return "✕"
+	}
+	status := strings.ToLower(strings.TrimSpace(t.Status))
+	switch {
+	case strings.Contains(status, "fail"), strings.Contains(status, "error"), strings.Contains(status, "denied"):
+		return "✕"
+	case t.Done || strings.Contains(status, "complete") || strings.Contains(status, "success") || status == "ok":
+		return "✓"
+	default:
+		return "…"
+	}
+}
+
+func oneLineCardSummary(s string, maxLen int) string {
+	s = strings.TrimSpace(strings.ReplaceAll(s, "\r\n", "\n"))
+	if s == "" {
+		return ""
+	}
+	if fields := strings.Fields(s); len(fields) > 0 {
+		s = strings.Join(fields, " ")
+	}
+	return truncateIf(s, maxLen)
+}
+
+func mergeCardToolResult(tools []cardToolEntry, event Event, result string, maxLen int) []cardToolEntry {
+	toolName := strings.TrimSpace(event.ToolName)
+	if toolName == "" {
+		toolName = "Tool"
+	}
+
+	idx := -1
+	for i := len(tools) - 1; i >= 0; i-- {
+		if strings.TrimSpace(tools[i].Name) == "" || strings.EqualFold(strings.TrimSpace(tools[i].Name), toolName) {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		tools = append(tools, cardToolEntry{
+			Index: len(tools) + 1,
+			Name:  toolName,
+			Input: oneLineCardSummary(event.ToolInput, maxLen),
+		})
+		idx = len(tools) - 1
+	}
+
+	if strings.TrimSpace(tools[idx].Name) == "" {
+		tools[idx].Name = toolName
+	}
+	if strings.TrimSpace(tools[idx].Input) == "" && strings.TrimSpace(event.ToolInput) != "" {
+		tools[idx].Input = oneLineCardSummary(event.ToolInput, maxLen)
+	}
+	if strings.TrimSpace(result) != "" {
+		tools[idx].Result = truncateIf(strings.TrimSpace(result), maxLen)
+	}
+	tools[idx].Status = strings.TrimSpace(event.ToolStatus)
+	tools[idx].ExitCode = event.ToolExitCode
+	tools[idx].Success = event.ToolSuccess
+	tools[idx].Done = true
+	return tools
 }
 
 // unsolicitedReaderStopTimeout bounds how long stopUnsolicitedReader waits
@@ -3495,6 +3581,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			slog.Warn("streaming card creation failed, falling back to normal messages", "error", err)
 		} else {
 			streamCard = sc
+			_ = streamCard.Update(e.ctx, buildCardContent("", nil, ""))
 			slog.Info("streaming card created for turn", "session", sessionKey)
 		}
 	}
@@ -3620,6 +3707,13 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if isEllipsisOnly(event.Content) {
 				break
 			}
+			if streamCard != nil && !streamCard.Failed() {
+				if e.display.ThinkingMessages {
+					cardThinkingText = truncateIf(event.Content, e.display.ThinkingMaxLen)
+					_ = streamCard.Update(e.ctx, buildCardContent(cardThinkingText, cardToolCalls, cardAnswerText.String()))
+				}
+				continue
+			}
 			if hasRichCard {
 				// When thinking messages are suppressed, skip card creation.
 				if !e.display.ThinkingMessages {
@@ -3676,12 +3770,6 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				silentHold = false
 			}
 			if e.display.ThinkingMessages && event.Content != "" {
-				// --- StreamingCard path ---
-				if streamCard != nil && !streamCard.Failed() {
-					cardThinkingText = truncateIf(event.Content, e.display.ThinkingMaxLen)
-					_ = streamCard.Update(e.ctx, buildCardContent(cardThinkingText, cardToolCalls, cardAnswerText.String()))
-					continue // skip original independent message sending
-				}
 				// --- Original path (fallback) ---
 				// Flush accumulated text segment before thinking display
 				previewActive := sp.canPreview()
@@ -3710,6 +3798,15 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 		case EventToolUse:
 			toolCount++
+			if streamCard != nil && !streamCard.Failed() {
+				cardToolCalls = append(cardToolCalls, cardToolEntry{
+					Index: toolCount,
+					Name:  event.ToolName,
+					Input: oneLineCardSummary(event.ToolInput, e.display.ToolMaxLen),
+				})
+				_ = streamCard.Update(e.ctx, buildCardContent(cardThinkingText, cardToolCalls, cardAnswerText.String()))
+				continue
+			}
 			if hasRichCard {
 				// When tool messages are suppressed, skip card updates on tool events.
 				if !e.display.ToolMessages {
@@ -3763,33 +3860,6 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				silentHold = false
 			}
 			if e.display.ToolMessages {
-				// --- StreamingCard path ---
-				if streamCard != nil && !streamCard.Failed() {
-					toolInput := event.ToolInput
-					var formattedInput string
-					if toolInput == "" {
-						formattedInput = ""
-					} else if strings.Contains(toolInput, "```") {
-						formattedInput = toolInput
-					} else if strings.Contains(toolInput, "\n") || utf8.RuneCountInString(toolInput) > 200 {
-						lang := toolCodeLang(event.ToolName, toolInput)
-						formattedInput = fmt.Sprintf("```%s\n%s\n```", lang, toolInput)
-					} else {
-						switch event.ToolName {
-						case "shell", "run_shell_command", "Bash":
-							formattedInput = fmt.Sprintf("```bash\n%s\n```", toolInput)
-						default:
-							formattedInput = fmt.Sprintf("`%s`", toolInput)
-						}
-					}
-					cardToolCalls = append(cardToolCalls, cardToolEntry{
-						Index: toolCount,
-						Name:  event.ToolName,
-						Input: formattedInput,
-					})
-					_ = streamCard.Update(e.ctx, buildCardContent(cardThinkingText, cardToolCalls, cardAnswerText.String()))
-					continue // skip original independent message sending
-				}
 				// --- Original path (fallback) ---
 				// Flush accumulated text segment before tool display
 				previewActive := sp.canPreview()
@@ -3835,6 +3905,18 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 		case EventToolResult:
+			if streamCard != nil && !streamCard.Failed() {
+				result := strings.TrimSpace(event.ToolResult)
+				if result == "" {
+					result = strings.TrimSpace(event.Content)
+				}
+				if result != "" {
+					result = truncateIf(result, e.display.ToolMaxLen)
+				}
+				cardToolCalls = mergeCardToolResult(cardToolCalls, event, result, e.display.ToolMaxLen)
+				_ = streamCard.Update(e.ctx, buildCardContent(cardThinkingText, cardToolCalls, cardAnswerText.String()))
+				continue
+			}
 			if e.display.ToolMessages {
 				result := strings.TrimSpace(event.ToolResult)
 				if result == "" {
@@ -4163,21 +4245,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 			replyStart := time.Now()
 
-			// --- StreamingCard path ---
-			if streamCard != nil && !streamCard.Failed() {
-				sp.finish("") // cleanup preview (should be no-op if card was active)
-				// Build final card content with full response
-				finalContent := buildCardContent(cardThinkingText, cardToolCalls, fullResponse)
-				if err := streamCard.Finalize(e.ctx, finalContent); err != nil {
-					slog.Error("streaming card finalize failed, sending fallback", "error", err)
-					// Fallback: send the response as a normal message
-					for _, chunk := range splitMessage(fullResponse, maxPlatformMessageLen) {
-						if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
-							return
-						}
+			if isSilent {
+				if streamCard != nil && !streamCard.Failed() {
+					if err := streamCard.Finalize(e.ctx, ""); err != nil {
+						slog.Debug("streaming card silent finalize failed", "error", err)
 					}
 				}
-			} else if isSilent {
 				// Silent reply: drop any in-flight preview and skip all send paths.
 				// sp.discard() clears previewMsgID so sp.needsDoneReaction() also returns false,
 				// preventing a stray done_emoji push.
@@ -4196,6 +4269,20 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					cardMessageID = nil
 				}
 				slog.Info("silent reply suppressed", "session", session.ID)
+			} else if streamCard != nil && !streamCard.Failed() {
+				// --- StreamingCard path ---
+				sp.finish("") // cleanup preview (should be no-op if card was active)
+				// Build final card content with full response
+				finalContent := buildCardContent(cardThinkingText, cardToolCalls, fullResponse)
+				if err := streamCard.Finalize(e.ctx, finalContent); err != nil {
+					slog.Error("streaming card finalize failed, sending fallback", "error", err)
+					// Fallback: send the response as a normal message
+					for _, chunk := range splitMessage(fullResponse, maxPlatformMessageLen) {
+						if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
+							return
+						}
+					}
+				}
 			} else if hasRichCard {
 				parts := []string{fullResponse}
 				if splitter, ok := p.(MarkdownTableSplitter); ok {
@@ -4382,6 +4469,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						slog.Warn("streaming card creation failed for queued turn", "error", err)
 					} else {
 						streamCard = sc
+						_ = streamCard.Update(e.ctx, buildCardContent("", nil, ""))
 					}
 				}
 
@@ -4462,7 +4550,17 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						break
 					}
 				}
-				e.send(p, replyCtx, userMsg)
+				sentViaCard := false
+				if streamCard != nil && !streamCard.Failed() {
+					if err := streamCard.Finalize(e.ctx, buildCardContent(cardThinkingText, cardToolCalls, userMsg)); err != nil {
+						slog.Debug("streaming card error finalize failed", "error", err)
+					} else {
+						sentViaCard = true
+					}
+				}
+				if !sentViaCard {
+					e.send(p, replyCtx, userMsg)
+				}
 			}
 			// Only drop queued messages if the agent session is dead.
 			// Some agents (e.g. Codex) emit EventError for per-turn failures
